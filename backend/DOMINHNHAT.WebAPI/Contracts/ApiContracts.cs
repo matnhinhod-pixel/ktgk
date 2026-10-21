@@ -1,0 +1,20 @@
+namespace DOMINHNHAT.WebAPI.Contracts;
+
+public sealed record RegisterRequest(string Username, string Email, string Password, string AccountType = "Employee");
+public sealed record LoginRequest(string Username, string Password);
+public sealed record VerifyOtpRequest(string ChallengeId, string Code);
+public sealed record AuthChallengeResponse(string ChallengeId, string Message, DateTimeOffset ExpiresAtUtc);
+public sealed record AuthResponse(string AccessToken, string RefreshToken, string TokenType, DateTimeOffset ExpiresAtUtc, UserResponse User);
+public sealed record RefreshRequest(string RefreshToken);
+public sealed record LogoutRequest(string RefreshToken);
+public sealed record UserResponse(string Id, string Username, string Email, string Role);
+public sealed record CreateEmployeeRequest(string EmployeeCode, string FullName, string Email, string Department, string? WorksiteId);
+public sealed record UpdateEmployeeRequest(string EmployeeCode, string FullName, string Email, string Department, string? WorksiteId, bool IsActive);
+public sealed record CreateShiftRequest(string Name, string StartTime, string EndTime, int GraceMinutes, string? WorksiteId);
+public sealed record UpdateShiftRequest(string Name, string StartTime, string EndTime, int GraceMinutes, string? WorksiteId, bool IsActive);
+public sealed record CheckInRequest(string ShiftId, string QrToken, double Latitude, double Longitude, double AccuracyMeters);
+public sealed record CheckOutRequest(double Latitude, double Longitude, double AccuracyMeters);
+public sealed record CreateQrRequest(string ShiftId, int LifetimeSeconds = 60);
+public sealed record ExplanationRequest(string Explanation);
+public sealed record UpdateAttendanceRequest(string VerificationStatus, string? Explanation);
+public sealed record WorksiteRequest(string Name, double Latitude, double Longitude, double AllowedRadiusMeters, bool IsActive = true);
