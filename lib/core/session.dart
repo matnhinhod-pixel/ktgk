@@ -5,7 +5,7 @@ import 'package:http/http.dart' as http;
 
 const apiBaseUrl = String.fromEnvironment(
   'API_BASE_URL',
-  defaultValue: 'https://repeated-citizen-sierra-computing.trycloudflare.com',
+  defaultValue: 'https://debug-launches-buyer-sociology.trycloudflare.com',
 );
 
 class ApiException implements Exception {
@@ -31,29 +31,30 @@ class SessionUser {
   final String role;
 
   factory SessionUser.fromJson(Map<String, dynamic> json) => SessionUser(
-        id: json['id']?.toString() ?? '',
-        username: json['username']?.toString() ?? '',
-        email: json['email']?.toString() ?? '',
-        role: json['role']?.toString() ?? 'Employee',
-      );
+    id: json['id']?.toString() ?? '',
+    username: json['username']?.toString() ?? '',
+    email: json['email']?.toString() ?? '',
+    role: json['role']?.toString() ?? '',
+  );
 }
 
 class SessionStore {
   SessionStore({FlutterSecureStorage? storage})
-      : _storage = storage ?? const FlutterSecureStorage();
+    : _storage = storage ?? const FlutterSecureStorage();
 
   static const _accessKey = 'access_token';
   static const _refreshKey = 'refresh_token';
-  static const _biometricKey = 'biometric_unlock_enabled';
+  static const _biometricKey = 'biometric_login_enabled';
   final FlutterSecureStorage _storage;
 
   Future<String?> get accessToken => _storage.read(key: _accessKey);
   Future<String?> get refreshToken => _storage.read(key: _refreshKey);
-  Future<bool> get biometricUnlockEnabled async =>
+  Future<bool> get biometricLoginEnabled async =>
       (await _storage.read(key: _biometricKey)) == 'true';
 
-  Future<void> setBiometricUnlockEnabled(bool enabled) =>
-      _storage.write(key: _biometricKey, value: enabled.toString());
+  Future<void> setBiometricLoginEnabled(bool enabled) => enabled
+      ? _storage.write(key: _biometricKey, value: 'true')
+      : _storage.delete(key: _biometricKey);
 
   Future<void> save(String access, String refresh) async {
     await _storage.write(key: _accessKey, value: access);
@@ -72,8 +73,8 @@ class ApiClient {
     required this.session,
     String baseUrl = apiBaseUrl,
     http.Client? client,
-  })  : _baseUri = Uri.parse(baseUrl),
-        _client = client ?? http.Client();
+  }) : _baseUri = Uri.parse(baseUrl),
+       _client = client ?? http.Client();
 
   final Uri _baseUri;
   final http.Client _client;
@@ -96,7 +97,9 @@ class ApiClient {
     bool allowRefresh = true,
     bool withAuth = true,
   }) async {
-    final uri = _baseUri.resolve(path.startsWith('/') ? path.substring(1) : path);
+    final uri = _baseUri.resolve(
+      path.startsWith('/') ? path.substring(1) : path,
+    );
     final headers = <String, String>{'Accept': 'application/json'};
     if (body != null) headers['Content-Type'] = 'application/json';
     if (withAuth) {
@@ -108,16 +111,32 @@ class ApiClient {
     try {
       final request = http.Request(method, uri)..headers.addAll(headers);
       if (body != null) request.body = jsonEncode(body);
-      final streamed = await _client.send(request).timeout(const Duration(seconds: 20));
-      response = await http.Response.fromStream(streamed).timeout(const Duration(seconds: 20));
+      final streamed = await _client
+          .send(request)
+          .timeout(const Duration(seconds: 20));
+      response = await http.Response.fromStream(
+        streamed,
+      ).timeout(const Duration(seconds: 20));
     } on Exception catch (error) {
-      throw ApiException(0, 'Cannot reach the API. Check your network or API URL. $error');
+      throw ApiException(
+        0,
+        'Cannot reach the API. Check your network or API URL. $error',
+      );
     }
 
-    if (response.statusCode == 401 && withAuth && allowRefresh && !_refreshing) {
+    if (response.statusCode == 401 &&
+        withAuth &&
+        allowRefresh &&
+        !_refreshing) {
       final renewed = await _refreshSession();
       if (renewed) {
-        return _send(method, path, body: body, allowRefresh: false, withAuth: withAuth);
+        return _send(
+          method,
+          path,
+          body: body,
+          allowRefresh: false,
+          withAuth: withAuth,
+        );
       }
     }
     if (response.statusCode < 200 || response.statusCode >= 300) {
@@ -133,17 +152,24 @@ class ApiClient {
     try {
       final refresh = await session.refreshToken;
       if (refresh == null || refresh.isEmpty) return false;
-      final result = await _send(
-        'POST',
-        '/api/v1/auth/refresh',
-        body: {'refreshToken': refresh},
-        allowRefresh: false,
-        withAuth: false,
-      ) as Map<String, dynamic>;
-      await session.save(result['accessToken'] as String, result['refreshToken'] as String);
+      final result =
+          await _send(
+                'POST',
+                '/api/v1/auth/refresh',
+                body: {'refreshToken': refresh},
+                allowRefresh: false,
+                withAuth: false,
+              )
+              as Map<String, dynamic>;
+      await session.save(
+        result['accessToken'] as String,
+        result['refreshToken'] as String,
+      );
       return true;
     } on ApiException catch (error) {
-      if (error.statusCode == 401 || error.statusCode == 403) await session.clear();
+      if (error.statusCode == 401 || error.statusCode == 403) {
+        await session.clear();
+      }
       return false;
     } catch (_) {
       return false;
@@ -156,7 +182,11 @@ class ApiClient {
     final refresh = await session.refreshToken;
     if (refresh != null) {
       try {
-        await _send('POST', '/api/v1/auth/logout', body: {'refreshToken': refresh});
+        await _send(
+          'POST',
+          '/api/v1/auth/logout',
+          body: {'refreshToken': refresh},
+        );
       } catch (_) {
         // Local credentials are still cleared when the API cannot be reached.
       }
@@ -168,6 +198,19 @@ class ApiClient {
     try {
       final body = jsonDecode(response.body);
       if (body is Map<String, dynamic>) {
+        switch (body['error']?.toString()) {
+          case 'qr_invalid_expired_or_used':
+          case 'qr_already_used_or_expired':
+            return 'Mã QR đã hết hạn hoặc đã được quét. Admin hãy tạo mã mới rồi quét ngay.';
+          case 'shift_not_found':
+            return 'Ca làm gắn với mã QR không còn tồn tại.';
+          case 'shift_inactive':
+            return 'Ca làm đã bị ngừng hoạt động. Hãy chọn ca khác.';
+          case 'open_attendance_exists':
+            return 'Bạn đã có lượt chấm công đang mở cho ca này.';
+          case 'no_open_attendance':
+            return 'Không tìm thấy lượt chấm công đang mở để check-out.';
+        }
         final errors = body['errors'];
         if (errors is Map) {
           final messages = <String>[];
@@ -180,7 +223,11 @@ class ApiClient {
           }
           if (messages.isNotEmpty) return messages.join('\n');
         }
-        return (body['detail'] ?? body['message'] ?? body['title'] ?? 'Request failed').toString();
+        return (body['detail'] ??
+                body['message'] ??
+                body['title'] ??
+                'Request failed')
+            .toString();
       }
     } catch (_) {
       if (response.body.isNotEmpty) return response.body;

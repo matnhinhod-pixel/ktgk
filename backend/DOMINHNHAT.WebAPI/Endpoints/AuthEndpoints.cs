@@ -10,11 +10,9 @@ public static class AuthEndpoints
     {
         var group = endpoints.MapGroup("/api/v1/auth").WithTags("Authentication");
         group.MapPost("/register", (RegisterRequest request, AuthService auth, CancellationToken ct) => auth.RegisterAsync(request, ct))
-            .WithName("RegisterAccount").WithSummary("Register a non-admin employee account").AllowAnonymous();
+            .WithName("RegisterAccount").WithSummary("Register an account after Firebase email verification").AllowAnonymous();
         group.MapPost("/login", (LoginRequest request, AuthService auth, CancellationToken ct) => auth.LoginAsync(request, ct))
-            .WithName("LoginWithPassword").WithSummary("Validate username/password and send an email OTP").AllowAnonymous();
-        group.MapPost("/verify-otp", (VerifyOtpRequest request, AuthService auth, CancellationToken ct) => auth.VerifyOtpAsync(request, ct))
-            .WithName("VerifyLoginOtp").WithSummary("Verify a one-time login code and receive a JWT").AllowAnonymous();
+            .WithName("LoginWithPassword").WithSummary("Validate username/password and issue a session").AllowAnonymous();
         group.MapPost("/refresh", (RefreshRequest request, AuthService auth, CancellationToken ct) => auth.RefreshAsync(request, ct))
             .WithName("RefreshSession").WithSummary("Rotate a refresh token and issue a new access token").AllowAnonymous();
         group.MapPost("/logout", (LogoutRequest request, AuthService auth, CancellationToken ct) => auth.LogoutAsync(request, ct))

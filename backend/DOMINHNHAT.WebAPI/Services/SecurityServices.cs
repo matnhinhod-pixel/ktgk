@@ -1,6 +1,4 @@
 using System.IdentityModel.Tokens.Jwt;
-using System.Net;
-using System.Net.Mail;
 using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
@@ -77,32 +75,4 @@ public sealed class TokenService
         ClockSkew = TimeSpan.FromSeconds(30)
     };
 
-    public string HashOtp(string challengeId, string code) => Convert.ToHexString(
-        HMACSHA256.HashData(_key, Encoding.UTF8.GetBytes($"{challengeId}:{code}")));
-}
-
-public sealed class OtpEmailSender(IConfiguration configuration)
-{
-    public bool IsConfigured =>
-        !string.IsNullOrWhiteSpace(configuration["Smtp:Host"]) &&
-        int.TryParse(configuration["Smtp:Port"], out _) &&
-        !string.IsNullOrWhiteSpace(configuration["Smtp:From"]);
-
-    public async Task SendAsync(string recipient, string code, CancellationToken cancellationToken)
-    {
-        if (!IsConfigured) throw new InvalidOperationException("Email OTP is not configured.");
-        var host = configuration["Smtp:Host"]!;
-        var port = int.Parse(configuration["Smtp:Port"]!);
-        using var message = new MailMessage(configuration["Smtp:From"]!, recipient,
-            "DOMINHNHAT verification code", $"Your verification code is {code}. It expires in 5 minutes.");
-        using var client = new SmtpClient(host, port)
-        {
-            EnableSsl = bool.TryParse(configuration["Smtp:EnableSsl"], out var ssl) && ssl,
-            DeliveryMethod = SmtpDeliveryMethod.Network
-        };
-        var username = configuration["Smtp:Username"];
-        var password = configuration["Smtp:Password"];
-        if (!string.IsNullOrWhiteSpace(username)) client.Credentials = new NetworkCredential(username, password);
-        await client.SendMailAsync(message, cancellationToken);
-    }
 }

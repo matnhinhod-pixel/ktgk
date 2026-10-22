@@ -66,26 +66,57 @@ public static class AttendanceEndpoints
                 ? localNow >= earliest && localNow <= end.ToTimeSpan()
                 : localNow >= earliest || localNow <= end.ToTimeSpan();
             var flags = new List<string>();
+            var checks = new List<Dictionary<string, object>>
+            {
+                Check("qr_valid", "Mã QR", true, "Mã QR hợp lệ, đúng ca và chưa được sử dụng."),
+                Check("inside_shift_window", "Thời gian ca", insideShift, insideShift ? "Đang trong khung giờ ca làm." : "Ngoài khung giờ ca làm.")
+            };
             if (!insideShift) flags.Add("outside_shift_window");
-            if (request.AccuracyMeters > 50) flags.Add("low_gps_accuracy");
+            var gpsAccurate = request.AccuracyMeters <= 50;
+            checks.Add(Check("gps_accuracy", "Độ chính xác GPS", gpsAccurate, $"Sai số {Math.Round(request.AccuracyMeters)} m (yêu cầu tối đa 50 m)."));
+            if (!gpsAccurate) flags.Add("low_gps_accuracy");
 
             var worksiteId = shift.GetValueOrDefault("worksiteId")?.ToString() ?? "";
+            double? distanceToWorksite = null;
+            double? allowedRadius = null;
+            var worksiteName = "";
             if (!string.IsNullOrWhiteSpace(worksiteId))
             {
                 var siteSnapshot = await db.Collection("worksites").Document(worksiteId).GetSnapshotAsync(ct);
                 if (siteSnapshot.Exists)
                 {
                     var site = siteSnapshot.ToDictionary();
-                    if (site.GetValueOrDefault("isActive") is not true) flags.Add("worksite_inactive");
+                    worksiteName = site.GetValueOrDefault("name")?.ToString() ?? "";
+                    var siteActive = site.GetValueOrDefault("isActive") is true;
+                    checks.Add(Check("worksite_active", "Nơi làm việc", siteActive, siteActive ? worksiteName : "Nơi làm việc đã ngừng hoạt động."));
+                    if (!siteActive) flags.Add("worksite_inactive");
                     var lat = Number(site.GetValueOrDefault("latitude"));
                     var lon = Number(site.GetValueOrDefault("longitude"));
                     var radius = Number(site.GetValueOrDefault("allowedRadiusMeters"));
-                    if (DistanceMeters(request.Latitude, request.Longitude, lat, lon) > radius + request.AccuracyMeters)
-                        flags.Add("outside_worksite_radius");
+                    distanceToWorksite = DistanceMeters(request.Latitude, request.Longitude, lat, lon);
+                    allowedRadius = radius;
+                    var withinRadius = distanceToWorksite <= radius + request.AccuracyMeters;
+                    checks.Add(Check("worksite_radius", "Khoảng cách", withinRadius,
+                        $"Cách nơi làm việc khoảng {Math.Round(distanceToWorksite.Value)} m; bán kính cho phép {Math.Round(radius)} m."));
+                    if (!withinRadius) flags.Add("outside_worksite_radius");
                 }
-                else flags.Add("worksite_not_configured");
+                else
+                {
+                    flags.Add("worksite_not_configured");
+                    checks.Add(Check("worksite_radius", "Khoảng cách", false, "Không tìm thấy nơi làm việc được gán cho ca."));
+                }
             }
-            else flags.Add("shift_has_no_worksite");
+            else
+            {
+                flags.Add("shift_has_no_worksite");
+                checks.Add(Check("worksite_radius", "Khoảng cách", false, "Ca làm chưa được gán nơi làm việc."));
+            }
+
+            // Reject a second open attendance before consuming the one-time QR.
+            // Otherwise an employee retrying check-in could burn a fresh QR without a record.
+            var previous = await db.Collection("attendanceRecords").WhereEqualTo("employeeId", userId)
+                .WhereEqualTo("shiftId", request.ShiftId).WhereEqualTo("status", "Open").Limit(1).GetSnapshotAsync(ct);
+            if (previous.Count > 0) return Results.Conflict(new { error = "open_attendance_exists" });
 
             var transactionResult = await db.Database!.RunTransactionAsync(async transaction =>
             {
@@ -101,10 +132,6 @@ public static class AttendanceEndpoints
             }, cancellationToken: ct);
             if (!transactionResult) return Results.Conflict(new { error = "qr_already_used_or_expired" });
 
-            var previous = await db.Collection("attendanceRecords").WhereEqualTo("employeeId", userId)
-                .WhereEqualTo("shiftId", request.ShiftId).WhereEqualTo("status", "Open").Limit(1).GetSnapshotAsync(ct);
-            if (previous.Count > 0) return Results.Conflict(new { error = "open_attendance_exists" });
-
             var recordId = Guid.NewGuid().ToString("N");
             var verification = flags.Count == 0 ? "Verified" : "ReviewRequired";
             var record = new Dictionary<string, object>
@@ -112,14 +139,25 @@ public static class AttendanceEndpoints
                 ["id"] = recordId, ["employeeId"] = userId, ["shiftId"] = request.ShiftId, ["qrChallengeId"] = qrSnapshot.Id,
                 ["checkInAt"] = Timestamp.FromDateTime(now.UtcDateTime), ["checkInLatitude"] = request.Latitude,
                 ["checkInLongitude"] = request.Longitude, ["checkInAccuracyMeters"] = request.AccuracyMeters,
+                ["shiftName"] = shift.GetValueOrDefault("name")?.ToString() ?? "",
+                ["worksiteName"] = worksiteName, ["qrVerified"] = true,
+                ["verificationChecks"] = checks,
                 ["status"] = "Open", ["verificationStatus"] = verification, ["flags"] = flags,
                 ["createdAt"] = Timestamp.GetCurrentTimestamp()
             };
+            if (distanceToWorksite is not null) record["distanceToWorksiteMeters"] = distanceToWorksite.Value;
+            if (allowedRadius is not null) record["allowedRadiusMeters"] = allowedRadius.Value;
             await db.Collection("attendanceRecords").Document(recordId).CreateAsync(record, ct);
+            await WriteAuditEventAsync(db, recordId, user, "check_in_recorded", verification, null, ct);
             return Results.Created($"/api/v1/attendance/{recordId}", new
             {
-                id = recordId, status = "Open", verificationStatus = verification, flags,
-                checkInAtUtc = now, message = verification == "Verified" ? "Attendance recorded." : "Attendance recorded and flagged for review."
+                id = recordId, employeeId = userId, shiftId = request.ShiftId,
+                shiftName = shift.GetValueOrDefault("name")?.ToString() ?? "",
+                worksiteName, status = "Open", verificationStatus = verification, flags,
+                qrVerified = true, checkInAccuracyMeters = request.AccuracyMeters,
+                distanceToWorksiteMeters = distanceToWorksite, allowedRadiusMeters = allowedRadius,
+                verificationChecks = checks,
+                checkInAtUtc = now, message = verification == "Verified" ? "Đã ghi nhận chấm công." : "Đã ghi nhận chấm công và chuyển quản lý xem xét."
             });
         }).RequireAuthorization("EmployeeOnly").WithName("CheckIn").WithSummary("Check in using a single-use QR token, GPS and shift window");
 
@@ -139,6 +177,7 @@ public static class AttendanceEndpoints
                 ["checkOutLongitude"] = request.Longitude, ["checkOutAccuracyMeters"] = request.AccuracyMeters,
                 ["status"] = "Closed", ["updatedAt"] = Timestamp.GetCurrentTimestamp()
             }, cancellationToken: ct);
+            await WriteAuditEventAsync(db, snapshot.Id, user, "check_out_recorded", "Closed", null, ct);
             return Results.Ok(new { id = snapshot.Id, status = "Closed", checkOutAtUtc = now });
         }).RequireAuthorization("EmployeeOnly").WithName("CheckOut");
 
@@ -161,22 +200,48 @@ public static class AttendanceEndpoints
             return Results.Ok(ToResponse(snapshot));
         }).RequireAuthorization("EmployeeOrAdmin").WithName("GetAttendanceRecord");
 
-        group.MapPut("/{id}", async (string id, UpdateAttendanceRequest request, FirestoreContext db, CancellationToken ct) =>
+        group.MapGet("/{id}/audit", async (string id, FirestoreContext db, ClaimsPrincipal user, CancellationToken ct) =>
         {
             if (!db.IsConfigured()) return Results.Problem("Firestore is not configured.", statusCode: 503);
-            if (request.VerificationStatus is not ("Verified" or "ReviewRequired" or "ExplanationSubmitted"))
-                return Results.ValidationProblem(new Dictionary<string, string[]> { ["verificationStatus"] = ["Allowed values: Verified, ReviewRequired, ExplanationSubmitted."] });
+            var record = await db.Collection("attendanceRecords").Document(id).GetSnapshotAsync(ct);
+            if (!record.Exists) return Results.NotFound();
+            if (!user.IsInRole("Admin") && !Equals(record.ToDictionary().GetValueOrDefault("employeeId"), CrudEndpoints.UserId(user))) return Results.Forbid();
+            var events = await db.Collection("attendanceAuditEvents").WhereEqualTo("attendanceId", id)
+                .Limit(100).GetSnapshotAsync(ct);
+            var response = events.Documents.Select(e =>
+            {
+                var data = e.ToDictionary();
+                return new
+                {
+                    id = e.Id, action = data.GetValueOrDefault("action")?.ToString(),
+                    actorRole = data.GetValueOrDefault("actorRole")?.ToString(),
+                    verificationStatus = data.GetValueOrDefault("verificationStatus")?.ToString(),
+                    note = data.GetValueOrDefault("note")?.ToString(),
+                    createdAtUtc = Utc(data.GetValueOrDefault("createdAt"))
+                };
+            }).OrderBy(e => e.createdAtUtc).ToList();
+            return Results.Ok(response);
+        }).RequireAuthorization("EmployeeOrAdmin").WithName("GetAttendanceAuditTrail").WithSummary("View the immutable attendance review history");
+
+        group.MapPut("/{id}", async (string id, UpdateAttendanceRequest request, FirestoreContext db, ClaimsPrincipal user, CancellationToken ct) =>
+        {
+            if (!db.IsConfigured()) return Results.Problem("Firestore is not configured.", statusCode: 503);
+            if (request.VerificationStatus is not ("Verified" or "ReviewRequired" or "Rejected"))
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["verificationStatus"] = ["Allowed values: Verified, ReviewRequired, Rejected."] });
             if (request.Explanation?.Length > 2000)
                 return Results.ValidationProblem(new Dictionary<string, string[]> { ["explanation"] = ["Admin note cannot exceed 2000 characters."] });
             var reference = db.Collection("attendanceRecords").Document(id);
-            if (!(await reference.GetSnapshotAsync(ct)).Exists) return Results.NotFound();
+            var snapshot = await reference.GetSnapshotAsync(ct);
+            if (!snapshot.Exists) return Results.NotFound();
             var updates = new Dictionary<string, object>
             {
                 ["verificationStatus"] = request.VerificationStatus,
                 ["reviewedAt"] = Timestamp.GetCurrentTimestamp()
             };
             if (request.Explanation is not null) updates["adminNote"] = request.Explanation.Trim();
+            updates["reviewedBy"] = CrudEndpoints.UserId(user);
             await reference.UpdateAsync(updates, cancellationToken: ct);
+            await WriteAuditEventAsync(db, id, user, "admin_reviewed", request.VerificationStatus, request.Explanation?.Trim(), ct);
             return Results.NoContent();
         }).RequireAuthorization("AdminOnly").WithName("UpdateAttendanceRecord").WithSummary("Admin review of attendance verification status");
 
@@ -194,10 +259,11 @@ public static class AttendanceEndpoints
                 ["explanation"] = request.Explanation.Trim(), ["explanationSubmittedAt"] = Timestamp.GetCurrentTimestamp(),
                 ["verificationStatus"] = "ExplanationSubmitted"
             }, cancellationToken: ct);
+            await WriteAuditEventAsync(db, id, user, "explanation_submitted", "ExplanationSubmitted", request.Explanation.Trim(), ct);
             return Results.Accepted($"/api/v1/attendance/{id}");
         }).RequireAuthorization("EmployeeOrAdmin").WithName("SubmitAttendanceExplanation");
 
-        group.MapDelete("/{id}", async (string id, FirestoreContext db, CancellationToken ct) =>
+        group.MapDelete("/{id}", async (string id, FirestoreContext db, ClaimsPrincipal user, CancellationToken ct) =>
         {
             if (!db.IsConfigured()) return Results.Problem("Firestore is not configured.", statusCode: 503);
             var reference = db.Collection("attendanceRecords").Document(id);
@@ -206,6 +272,7 @@ public static class AttendanceEndpoints
             {
                 ["status"] = "Voided", ["voidedAt"] = Timestamp.GetCurrentTimestamp()
             }, cancellationToken: ct);
+            await WriteAuditEventAsync(db, id, user, "attendance_voided", "Voided", null, ct);
             return Results.NoContent();
         }).RequireAuthorization("AdminOnly").WithName("VoidAttendanceRecord").WithSummary("Void a record while retaining its audit history");
 
@@ -215,6 +282,24 @@ public static class AttendanceEndpoints
     private static bool ValidLocation(double lat, double lon, double accuracy) =>
         double.IsFinite(lat) && double.IsFinite(lon) && lat is >= -90 and <= 90 && lon is >= -180 and <= 180 && double.IsFinite(accuracy) && accuracy is >= 0 and <= 200;
     private static double Number(object? value) => value is null ? 0 : Convert.ToDouble(value);
+    private static Dictionary<string, object> Check(string code, string label, bool passed, string detail) => new()
+    {
+        ["code"] = code, ["label"] = label, ["passed"] = passed, ["detail"] = detail
+    };
+    private static Task WriteAuditEventAsync(FirestoreContext db, string attendanceId, ClaimsPrincipal user, string action, string status, string? note, CancellationToken ct)
+    {
+        var reference = db.Collection("attendanceAuditEvents").Document();
+        var data = new Dictionary<string, object>
+        {
+            ["id"] = reference.Id, ["attendanceId"] = attendanceId,
+            ["actorId"] = CrudEndpoints.UserId(user),
+            ["actorRole"] = user.FindFirstValue(ClaimTypes.Role) ?? "Unknown",
+            ["action"] = action, ["verificationStatus"] = status,
+            ["createdAt"] = Timestamp.GetCurrentTimestamp()
+        };
+        if (!string.IsNullOrWhiteSpace(note)) data["note"] = note;
+        return reference.CreateAsync(data, cancellationToken: ct);
+    }
     private static double DistanceMeters(double lat1, double lon1, double lat2, double lon2)
     {
         const double earthRadius = 6_371_000;
@@ -237,8 +322,13 @@ public static class AttendanceEndpoints
         return new
         {
             id = snapshot.Id, employeeId = d.GetValueOrDefault("employeeId")?.ToString(), shiftId = d.GetValueOrDefault("shiftId")?.ToString(),
+            shiftName = d.GetValueOrDefault("shiftName")?.ToString(), worksiteName = d.GetValueOrDefault("worksiteName")?.ToString(),
             status = d.GetValueOrDefault("status")?.ToString(), verificationStatus = d.GetValueOrDefault("verificationStatus")?.ToString(),
             checkInAtUtc = Utc(d.GetValueOrDefault("checkInAt")), checkOutAtUtc = Utc(d.GetValueOrDefault("checkOutAt")),
+            checkInAccuracyMeters = d.GetValueOrDefault("checkInAccuracyMeters"),
+            distanceToWorksiteMeters = d.GetValueOrDefault("distanceToWorksiteMeters"),
+            allowedRadiusMeters = d.GetValueOrDefault("allowedRadiusMeters"), qrVerified = d.GetValueOrDefault("qrVerified"),
+            verificationChecks = d.GetValueOrDefault("verificationChecks"), reviewedBy = d.GetValueOrDefault("reviewedBy")?.ToString(),
             flags = d.GetValueOrDefault("flags"), explanation = d.GetValueOrDefault("explanation")?.ToString(),
             adminNote = d.GetValueOrDefault("adminNote")?.ToString()
         };

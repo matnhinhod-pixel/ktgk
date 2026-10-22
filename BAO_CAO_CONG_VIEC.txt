@@ -1,31 +1,9 @@
-BÁO CÁO CÔNG VIỆC ĐÃ THỰC HIỆN
-Dự án: DOMINHNHAT - Ứng dụng chấm công (6 điểm)
-Ngày lập: 21/10/2026
+1. Đăng ký tài khoản qua email
+2. Đăng nhập bằng username và mật khẩu
+3. Phân quyền Admin/Employee/Guest
+4. Các chức năng CRUD — 4.5/5
+5. Chọn 3/6 chức năng nâng cao — 2
+6. Tính năng mới — 0.5
+7. Giao diện đẹp, dễ dùng — 0.5
 
-1. TỔNG QUAN
-- Xây dựng ứng dụng di động Flutter cho Android và backend REST API bằng ASP.NET Core trên .NET 8.0.132.
-- Backend sử dụng Firebase Firestore để lưu tài khoản, nhân viên, ca làm, địa điểm và dữ liệu chấm công.
-- Ứng dụng giao tiếp với backend qua HTTPS; không đưa thông tin xác thực quản trị Firestore vào APK.
-
-2. CHỨC NĂNG TÀI KHOẢN VÀ PHÂN QUYỀN
-- Đăng ký tài khoản Employee (Nhân viên) hoặc Guest (Khách).
-- Đăng nhập bằng tên tài khoản và mật khẩu; mật khẩu được lưu dưới dạng PBKDF2 hash.
-- Hỗ trợ OTP email khi cấu hình bật; mã OTP có thời hạn và chỉ dùng một lần.
-- Hỗ trợ bỏ qua OTP cho demo cục bộ thông qua cấu hình Auth:RequireEmailOtp=false. Chế độ demo vẫn kiểm tra tên đăng nhập và mật khẩu.
-- Khi đăng nhập thành công, backend cấp access token và refresh token; refresh token được xoay vòng khi làm mới phiên.
-- API và giao diện áp dụng quyền theo vai trò Employee, Guest và Admin.
-- Tài khoản minhnhat hiện có đã được cập nhật vai trò Admin trong Firestore để sử dụng chức năng quản trị.
-
-3. CHỨC NĂNG QUẢN TRỊ
-- Quản lý hồ sơ nhân viên: xem, tạo, cập nhật và xóa mềm.
-- Quản lý ca làm: xem, tạo, cập nhật và ngừng kích hoạt.
-- Quản lý địa điểm làm việc, tọa độ GPS và bán kính chấm công.
-- Tạo mã QR chấm công gắn với ca làm; mã có thời hạn và chỉ sử dụng một lần.
-- Xem và rà soát bản ghi chấm công; cập nhật trạng thái xác minh hoặc hủy bản ghi theo quyền Admin.
-
-4. CHỨC NĂNG NHÂN VIÊN VÀ KHÁCH
-- Nhân viên quét QR để check-in và check-out.
-- Kiểm tra mã QR, thời hạn ca, vị trí, độ chính xác GPS và bán kính địa điểm khi chấm công.
-- Nhân viên xem lịch sử chấm công và gửi giải trình cho bản ghi cần rà soát.
-- Khách xem các ca làm đang hoạt động; không được sử dụng chức năng chấm công.
-
+TỔNG ĐIỂM DỰ KIẾN — 7.5

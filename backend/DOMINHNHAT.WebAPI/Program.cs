@@ -1,12 +1,23 @@
 using DOMINHNHAT.WebAPI.Endpoints;
 using DOMINHNHAT.WebAPI.Infrastructure;
 using DOMINHNHAT.WebAPI.Services;
+using FirebaseAdmin;
+using FirebaseAdmin.Auth;
+using Google.Apis.Auth.OAuth2;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<FirestoreContext>();
+builder.Services.AddSingleton<FirebaseAuth>(_ =>
+{
+    var firebaseApp = FirebaseApp.Create(new AppOptions
+    {
+        Credential = GoogleCredential.GetApplicationDefault(),
+        ProjectId = builder.Configuration["Firestore:ProjectId"]
+    }, "DOMINHNHAT.Auth");
+    return FirebaseAuth.GetAuth(firebaseApp);
+});
 builder.Services.AddSingleton<PasswordService>();
-builder.Services.AddSingleton<OtpEmailSender>();
 builder.Services.AddScoped<AuthService>();
 builder.Services.AddSingleton<AuthorizeOperationFilter>();
 

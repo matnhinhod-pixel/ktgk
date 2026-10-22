@@ -1,7 +1,9 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Net.Mail;
 using DOMINHNHAT.WebAPI.Contracts;
 using DOMINHNHAT.WebAPI.Infrastructure;
+using FirebaseAdmin.Auth;
 using Google.Cloud.Firestore;
 
 namespace DOMINHNHAT.WebAPI.Services;
@@ -10,8 +12,7 @@ public sealed class AuthService(
     FirestoreContext firestore,
     PasswordService passwords,
     TokenService tokens,
-    OtpEmailSender email,
-    IConfiguration configuration,
+    IServiceProvider services,
     ILogger<AuthService> logger)
 {
     public async Task<IResult> RegisterAsync(RegisterRequest request, CancellationToken cancellationToken)
@@ -29,10 +30,39 @@ public sealed class AuthService(
         var emailAddress = request.Email.Trim();
         if (username.Length is < 3 or > 40 || !username.All(c => char.IsLetterOrDigit(c) || c is '_' or '.' or '-'))
             return Results.ValidationProblem(new Dictionary<string, string[]> { ["username"] = ["Username must be 3–40 characters and contain only letters, digits, '.', '_' or '-'."] });
-        if (emailAddress.Length > 254 || !emailAddress.Contains('@'))
+        if (emailAddress.Length > 254 || !MailAddress.TryCreate(emailAddress, out var parsedEmail) ||
+            !string.Equals(parsedEmail.Address, emailAddress, StringComparison.OrdinalIgnoreCase))
             return Results.ValidationProblem(new Dictionary<string, string[]> { ["email"] = ["A valid email is required."] });
         if (request.Password.Length < 10 || request.Password.Length > 128)
             return Results.ValidationProblem(new Dictionary<string, string[]> { ["password"] = ["Password must be 10–128 characters."] });
+
+        if (string.IsNullOrWhiteSpace(request.IdToken)) return Results.Unauthorized();
+        FirebaseAuth firebaseAuth;
+        try
+        {
+            firebaseAuth = services.GetRequiredService<FirebaseAuth>();
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            logger.LogError(exception, "Firebase Admin credentials are unavailable for email registration.");
+            return Results.Problem("Firebase Admin credentials are not configured on the backend.", statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+
+        FirebaseToken identity;
+        try
+        {
+            identity = await firebaseAuth.VerifyIdTokenAsync(request.IdToken, cancellationToken);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            logger.LogWarning(exception, "Firebase email registration token validation failed.");
+            return Results.Unauthorized();
+        }
+        var verifiedEmail = identity.Claims.GetValueOrDefault("email")?.ToString()?.Trim();
+        if (identity.Claims.GetValueOrDefault("email_verified") is not true ||
+            string.IsNullOrWhiteSpace(verifiedEmail) ||
+            !string.Equals(verifiedEmail, emailAddress, StringComparison.OrdinalIgnoreCase))
+            return Results.ValidationProblem(new Dictionary<string, string[]> { ["email"] = ["Verify the submitted email address before registering."] });
 
         var normalizedUsername = username.ToLowerInvariant();
         var normalizedEmail = emailAddress.ToLowerInvariant();
@@ -51,6 +81,8 @@ public sealed class AuthService(
             ["usernameNormalized"] = normalizedUsername,
             ["email"] = emailAddress,
             ["emailNormalized"] = normalizedEmail,
+            ["firebaseUid"] = identity.Uid,
+            ["emailVerified"] = true,
             ["passwordHash"] = passwords.Hash(request.Password),
             ["role"] = accountType,
             ["isActive"] = true,
@@ -86,11 +118,10 @@ public sealed class AuthService(
     public async Task<IResult> LoginAsync(LoginRequest request, CancellationToken cancellationToken)
     {
         if (firestore.Database is null) return Results.Problem("Firestore is not configured.", statusCode: 503);
-        var requireEmailOtp = configuration.GetValue("Auth:RequireEmailOtp", true);
-        if (requireEmailOtp && !email.IsConfigured) return Results.Problem("Email OTP is not configured.", statusCode: 503);
         if (string.IsNullOrWhiteSpace(request.Username) || string.IsNullOrEmpty(request.Password)) return Results.Unauthorized();
-        var username = request.Username.Trim().ToLowerInvariant();
-        var userId = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(username))).ToLowerInvariant();
+        var username = request.Username.Trim();
+        var normalizedUsername = username.ToLowerInvariant();
+        var userId = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalizedUsername))).ToLowerInvariant();
         var userSnapshot = await firestore.Collection("users").Document(userId).GetSnapshotAsync(cancellationToken);
         if (!userSnapshot.Exists) return Results.Unauthorized();
         var user = userSnapshot.ToDictionary();
@@ -98,71 +129,7 @@ public sealed class AuthService(
         if (passwordHash is null || !passwords.Verify(request.Password, passwordHash) || user.GetValueOrDefault("isActive") is not true)
             return Results.Unauthorized();
 
-        if (!requireEmailOtp)
-            return Results.Ok(await CreateAuthResponseAsync(userId, user, cancellationToken));
-
-        var challengeId = Guid.NewGuid().ToString("N");
-        var code = RandomNumberGenerator.GetInt32(0, 1_000_000).ToString("D6");
-        var expires = DateTimeOffset.UtcNow.AddMinutes(5);
-        await firestore.Collection("otpChallenges").Document(challengeId).CreateAsync(new Dictionary<string, object>
-        {
-            ["userId"] = userId,
-            ["codeHash"] = tokens.HashOtp(challengeId, code),
-            ["attemptCount"] = 0,
-            ["expiresAt"] = Timestamp.FromDateTime(expires.UtcDateTime),
-            ["consumed"] = false,
-            ["createdAt"] = Timestamp.GetCurrentTimestamp()
-        }, cancellationToken);
-
-        try
-        {
-            await email.SendAsync((string)user["email"], code, cancellationToken);
-        }
-        catch (Exception exception)
-        {
-            logger.LogError(exception, "Could not send login OTP.");
-            await firestore.Collection("otpChallenges").Document(challengeId).DeleteAsync(cancellationToken: cancellationToken);
-            return Results.Problem("Unable to deliver OTP email.", statusCode: 502);
-        }
-        return Results.Ok(new AuthChallengeResponse(challengeId, "OTP sent to the registered email address.", expires));
-    }
-
-    public async Task<IResult> VerifyOtpAsync(VerifyOtpRequest request, CancellationToken cancellationToken)
-    {
-        if (firestore.Database is null) return Results.Problem("Firestore is not configured.", statusCode: 503);
-        if (string.IsNullOrWhiteSpace(request.ChallengeId) || request.Code is null || request.Code.Length != 6 || !request.Code.All(char.IsDigit))
-            return Results.Unauthorized();
-        var challengeRef = firestore.Collection("otpChallenges").Document(request.ChallengeId);
-        var outcome = await firestore.Database.RunTransactionAsync(async transaction =>
-        {
-            var snapshot = await transaction.GetSnapshotAsync(challengeRef);
-            if (!snapshot.Exists) return (UserId: (string?)null, Valid: false);
-            var challenge = snapshot.ToDictionary();
-            var expires = challenge.GetValueOrDefault("expiresAt") is Timestamp value ? value : (Timestamp?)null;
-            var attempts = Convert.ToInt32(challenge.GetValueOrDefault("attemptCount") ?? 0);
-            var storedHash = challenge.GetValueOrDefault("codeHash") as string;
-            if (expires is null || expires.Value.ToDateTime() <= DateTime.UtcNow || challenge.GetValueOrDefault("consumed") is true || attempts >= 5 || storedHash is null)
-                return (UserId: (string?)null, Valid: false);
-            var candidateHash = tokens.HashOtp(request.ChallengeId, request.Code.Trim());
-            if (!CryptographicOperations.FixedTimeEquals(Convert.FromHexString(candidateHash), Convert.FromHexString(storedHash)))
-            {
-                transaction.Update(challengeRef, "attemptCount", attempts + 1);
-                return (UserId: (string?)null, Valid: false);
-            }
-            transaction.Update(challengeRef, new Dictionary<string, object>
-            {
-                ["consumed"] = true,
-                ["consumedAt"] = Timestamp.GetCurrentTimestamp()
-            });
-            return (UserId: challenge.GetValueOrDefault("userId")?.ToString(), Valid: true);
-        }, cancellationToken: cancellationToken);
-        if (!outcome.Valid || string.IsNullOrWhiteSpace(outcome.UserId)) return Results.Unauthorized();
-
-        var userSnapshot = await firestore.Collection("users").Document(outcome.UserId).GetSnapshotAsync(cancellationToken);
-        if (!userSnapshot.Exists) return Results.Unauthorized();
-        var user = userSnapshot.ToDictionary();
-        if (user.GetValueOrDefault("isActive") is not true) return Results.Forbid();
-        return Results.Ok(await CreateAuthResponseAsync(outcome.UserId, user, cancellationToken));
+        return Results.Ok(await CreateAuthResponseAsync(userId, user, cancellationToken));
     }
 
     public async Task<IResult> RefreshAsync(RefreshRequest request, CancellationToken cancellationToken)

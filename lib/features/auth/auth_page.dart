@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 
 import '../../core/session.dart';
 
@@ -17,13 +18,10 @@ class _AuthPageState extends State<AuthPage> {
   final _username = TextEditingController();
   final _email = TextEditingController();
   final _password = TextEditingController();
-  final _otp = TextEditingController();
   bool _register = false;
-  bool _waitingForOtp = false;
   bool _busy = false;
   bool _hidePassword = true;
   String _accountType = 'Employee';
-  String? _challengeId;
   String? _error;
 
   @override
@@ -31,7 +29,6 @@ class _AuthPageState extends State<AuthPage> {
     _username.dispose();
     _email.dispose();
     _password.dispose();
-    _otp.dispose();
     super.dispose();
   }
 
@@ -42,54 +39,19 @@ class _AuthPageState extends State<AuthPage> {
       _error = null;
     });
     try {
-      if (_waitingForOtp) {
-        final response = await widget.api.postPublic('/api/v1/auth/verify-otp', {
-          'challengeId': _challengeId,
-          'code': _otp.text.trim(),
-        }) as Map<String, dynamic>;
-        await widget.api.session.save(
-          response['accessToken'] as String,
-          response['refreshToken'] as String,
-        );
-        widget.onAuthenticated(SessionUser.fromJson(
-          Map<String, dynamic>.from(response['user'] as Map),
-        ));
-      } else if (_register) {
-        await widget.api.postPublic('/api/v1/auth/register', {
-          'username': _username.text.trim(),
-          'email': _email.text.trim(),
-          'password': _password.text,
-          'accountType': _accountType,
-        });
-        if (!mounted) return;
-        setState(() => _register = false);
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Tài khoản đã tạo. Đăng nhập để nhận OTP qua email.')),
-        );
+      if (_register) {
+        await _registerWithEmail();
       } else {
-        final response = await widget.api.postPublic('/api/v1/auth/login', {
-          'username': _username.text.trim(),
-          'password': _password.text,
-        }) as Map<String, dynamic>;
-        if (!mounted) return;
-        if (response['accessToken'] is String) {
-          await widget.api.session.save(
-            response['accessToken'] as String,
-            response['refreshToken'] as String,
-          );
-          widget.onAuthenticated(SessionUser.fromJson(
-            Map<String, dynamic>.from(response['user'] as Map),
-          ));
-        } else {
-          setState(() {
-            _challengeId = response['challengeId'] as String;
-            _waitingForOtp = true;
-          });
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Đã gửi mã OTP tới email đăng ký.')),
-          );
-        }
+        final response =
+            await widget.api.postPublic('/api/v1/auth/login', {
+                  'username': _username.text.trim(),
+                  'password': _password.text,
+                })
+                as Map<String, dynamic>;
+        await _acceptSession(response);
       }
+    } on FirebaseAuthException catch (exception) {
+      if (mounted) setState(() => _error = _firebaseAuthError(exception));
     } on ApiException catch (exception) {
       if (mounted) setState(() => _error = _friendlyError(exception));
     } catch (_) {
@@ -99,17 +61,119 @@ class _AuthPageState extends State<AuthPage> {
     }
   }
 
+  Future<void> _registerWithEmail() async {
+    final auth = FirebaseAuth.instance;
+    final email = _email.text.trim();
+    final password = _password.text;
+    User? user = auth.currentUser;
+
+    if (user?.email?.toLowerCase() != email.toLowerCase()) {
+      if (user != null) await auth.signOut();
+      try {
+        final credential = await auth.createUserWithEmailAndPassword(
+          email: email,
+          password: password,
+        );
+        user = credential.user;
+      } on FirebaseAuthException catch (exception) {
+        if (exception.code != 'email-already-in-use') rethrow;
+        final credential = await auth.signInWithEmailAndPassword(
+          email: email,
+          password: password,
+        );
+        user = credential.user;
+      }
+    }
+
+    if (user == null) {
+      throw StateError('Không tạo được tài khoản email.');
+    }
+
+    await user.reload();
+    user = auth.currentUser;
+    if (user == null) throw StateError('Phiên đăng ký email đã hết hạn.');
+    if (!user.emailVerified) {
+      await user.sendEmailVerification();
+      await auth.signOut();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Đã gửi email xác minh tới $email. Xác minh xong, quay lại đây và bấm Đăng ký để hoàn tất.',
+          ),
+          duration: const Duration(seconds: 7),
+        ),
+      );
+      return;
+    }
+
+    final idToken = await user.getIdToken(true);
+    if (idToken == null || idToken.isEmpty) {
+      throw StateError('Không xác thực được email với máy chủ.');
+    }
+    await widget.api.postPublic('/api/v1/auth/register', {
+      'username': _username.text.trim(),
+      'email': email,
+      'password': password,
+      'accountType': _accountType,
+      'idToken': idToken,
+    });
+    await auth.signOut();
+    if (!mounted) return;
+    setState(() => _register = false);
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          'Email đã xác minh. Tài khoản được tạo, bạn có thể đăng nhập.',
+        ),
+      ),
+    );
+  }
+
+  Future<void> _acceptSession(Map<String, dynamic> response) async {
+    final accessToken = response['accessToken'];
+    final refreshToken = response['refreshToken'];
+    final user = response['user'];
+    if (accessToken is! String || refreshToken is! String || user is! Map) {
+      throw const FormatException(
+        'Máy chủ trả về phiên đăng nhập không hợp lệ.',
+      );
+    }
+    await widget.api.session.save(accessToken, refreshToken);
+    if (mounted) {
+      widget.onAuthenticated(
+        SessionUser.fromJson(Map<String, dynamic>.from(user)),
+      );
+    }
+  }
+
   String _friendlyError(ApiException exception) {
-    if (exception.statusCode == 0) return 'Không kết nối được máy chủ. Kiểm tra mạng hoặc URL API.';
-    if (exception.statusCode == 503) return 'Dịch vụ chưa được cấu hình Firestore hoặc email OTP.';
+    if (exception.statusCode == 0) {
+      return 'Không kết nối được máy chủ. Kiểm tra mạng hoặc URL API.';
+    }
+    if (exception.statusCode == 503) {
+      return 'Dịch vụ Firebase/Firestore trên máy chủ chưa được cấu hình.';
+    }
     if (exception.statusCode == 401) {
-      return _waitingForOtp
-          ? 'Mã OTP sai, hết hạn hoặc đã được sử dụng.'
-          : 'Tên đăng nhập hoặc mật khẩu không đúng.';
+      return 'Tên đăng nhập hoặc mật khẩu không hợp lệ.';
     }
     if (exception.statusCode == 409) return exception.message;
     return exception.message;
   }
+
+  String _firebaseAuthError(
+    FirebaseAuthException exception,
+  ) => switch (exception.code) {
+    'operation-not-allowed' =>
+      'Firebase chưa bật phương thức đăng nhập Email/Password.',
+    'email-already-in-use' => 'Email này đã được đăng ký.',
+    'invalid-credential' ||
+    'wrong-password' => 'Email đã có tài khoản. Hãy kiểm tra lại mật khẩu.',
+    'weak-password' => 'Mật khẩu chưa đủ mạnh.',
+    'too-many-requests' => 'Thao tác quá nhiều lần. Vui lòng thử lại sau.',
+    _ =>
+      'Không thể xác thực email. Vui lòng kiểm tra cấu hình Firebase và thử lại.',
+  };
 
   @override
   Widget build(BuildContext context) {
@@ -120,7 +184,11 @@ class _AuthPageState extends State<AuthPage> {
           gradient: LinearGradient(
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
-            colors: [colors.primaryContainer.withValues(alpha: .42), colors.surface, colors.surface],
+            colors: [
+              colors.primaryContainer.withValues(alpha: .42),
+              colors.surface,
+              colors.surface,
+            ],
           ),
         ),
         child: SafeArea(
@@ -145,93 +213,136 @@ class _AuthPageState extends State<AuthPage> {
                             child: const Icon(Icons.badge_outlined, size: 30),
                           ),
                           const SizedBox(height: 18),
-          Text('DOMINHNHAT', textAlign: TextAlign.center,
-                              style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w800)),
+                          Text(
+                            'DOMINHNHAT',
+                            textAlign: TextAlign.center,
+                            style: Theme.of(context).textTheme.headlineSmall
+                                ?.copyWith(fontWeight: FontWeight.w800),
+                          ),
                           const SizedBox(height: 6),
                           Text(
-                            _waitingForOtp ? 'Xác minh đăng nhập' : (_register ? 'Tạo tài khoản ${_accountType == 'Guest' ? 'khách' : 'nhân viên'}' : 'Chấm công thông minh'),
+                            _register
+                                ? 'Tạo tài khoản ${_accountType == 'Guest' ? 'khách' : 'nhân viên'}'
+                                : 'Chấm công thông minh',
                             textAlign: TextAlign.center,
-                            style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: colors.onSurfaceVariant),
+                            style: Theme.of(context).textTheme.bodyMedium
+                                ?.copyWith(color: colors.onSurfaceVariant),
                           ),
                           const SizedBox(height: 26),
-                          if (!_waitingForOtp) ...[
-                            _field(_username, 'Tên đăng nhập', Icons.person_outline,
-                                validator: _register ? _validUsername : _required),
-                            if (_register) ...[
-                              const SizedBox(height: 14),
-                              DropdownButtonFormField<String>(
-                                initialValue: _accountType,
-                                decoration: const InputDecoration(
-                                  labelText: 'Loại tài khoản',
-                                  prefixIcon: Icon(Icons.badge_outlined),
-                                ),
-                                items: const [
-                                  DropdownMenuItem(value: 'Employee', child: Text('Nhân viên')),
-                                  DropdownMenuItem(value: 'Guest', child: Text('Khách / Customer')),
-                                ],
-                                onChanged: (value) {
-                                  if (value != null) setState(() => _accountType = value);
-                                },
-                              ),
-                              const SizedBox(height: 14),
-                              _field(_email, 'Email', Icons.mail_outline, keyboardType: TextInputType.emailAddress,
-                                  validator: (value) => value != null && value.contains('@') ? null : 'Nhập email hợp lệ.'),
-                            ],
+                          _field(
+                            _username,
+                            'Tên đăng nhập',
+                            Icons.person_outline,
+                            validator: _register ? _validUsername : _required,
+                          ),
+                          if (_register) ...[
                             const SizedBox(height: 14),
-                            TextFormField(
-                              controller: _password,
-                              obscureText: _hidePassword,
-                              validator: (value) {
-                                if (value == null || value.isEmpty) return 'Nhập mật khẩu.';
-                                if (_register && value.length < 10) return 'Mật khẩu cần ít nhất 10 ký tự.';
-                                if (_register && value.length > 128) return 'Mật khẩu tối đa 128 ký tự.';
-                                return null;
+                            DropdownButtonFormField<String>(
+                              initialValue: _accountType,
+                              decoration: const InputDecoration(
+                                labelText: 'Loại tài khoản',
+                                prefixIcon: Icon(Icons.badge_outlined),
+                              ),
+                              items: const [
+                                DropdownMenuItem(
+                                  value: 'Employee',
+                                  child: Text('Nhân viên'),
+                                ),
+                                DropdownMenuItem(
+                                  value: 'Guest',
+                                  child: Text('Khách / Customer'),
+                                ),
+                              ],
+                              onChanged: (value) {
+                                if (value != null) {
+                                  setState(() => _accountType = value);
+                                }
                               },
-                              decoration: InputDecoration(
-                                labelText: 'Mật khẩu',
-                                prefixIcon: const Icon(Icons.lock_outline),
-                                suffixIcon: IconButton(
-                                  onPressed: () => setState(() => _hidePassword = !_hidePassword),
-                                  icon: Icon(_hidePassword ? Icons.visibility_outlined : Icons.visibility_off_outlined),
+                            ),
+                            const SizedBox(height: 14),
+                            _field(
+                              _email,
+                              'Gmail / email',
+                              Icons.mail_outline,
+                              keyboardType: TextInputType.emailAddress,
+                              validator: _validEmail,
+                            ),
+                          ],
+                          const SizedBox(height: 14),
+                          TextFormField(
+                            controller: _password,
+                            obscureText: _hidePassword,
+                            validator: (value) {
+                              if (value == null || value.isEmpty) {
+                                return 'Nhập mật khẩu.';
+                              }
+                              if (_register && value.length < 10) {
+                                return 'Mật khẩu cần ít nhất 10 ký tự.';
+                              }
+                              if (_register && value.length > 128) {
+                                return 'Mật khẩu tối đa 128 ký tự.';
+                              }
+                              return null;
+                            },
+                            decoration: InputDecoration(
+                              labelText: 'Mật khẩu',
+                              prefixIcon: const Icon(Icons.lock_outline),
+                              suffixIcon: IconButton(
+                                onPressed: () => setState(
+                                  () => _hidePassword = !_hidePassword,
+                                ),
+                                icon: Icon(
+                                  _hidePassword
+                                      ? Icons.visibility_outlined
+                                      : Icons.visibility_off_outlined,
                                 ),
                               ),
                             ),
-                          ] else ...[
-                            Text('Nhập mã 6 chữ số đã gửi tới email của bạn.',
-                                style: Theme.of(context).textTheme.bodyMedium),
-                            const SizedBox(height: 16),
-                            _field(_otp, 'Mã OTP', Icons.password, keyboardType: TextInputType.number,
-                                validator: (value) => value != null && RegExp(r'^\d{6}$').hasMatch(value)
-                                    ? null : 'Mã OTP gồm 6 chữ số.'),
-                          ],
+                          ),
                           if (_error != null) ...[
                             const SizedBox(height: 14),
                             Container(
                               padding: const EdgeInsets.all(12),
-                              decoration: BoxDecoration(color: colors.errorContainer, borderRadius: BorderRadius.circular(12)),
-                              child: Text(_error!, style: TextStyle(color: colors.onErrorContainer)),
+                              decoration: BoxDecoration(
+                                color: colors.errorContainer,
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                              child: Text(
+                                _error!,
+                                style: TextStyle(
+                                  color: colors.onErrorContainer,
+                                ),
+                              ),
                             ),
                           ],
                           const SizedBox(height: 22),
                           FilledButton.icon(
                             onPressed: _busy ? null : _submit,
                             icon: _busy
-                                ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
-                                : Icon(_waitingForOtp ? Icons.verified_user_outlined : Icons.arrow_forward_rounded),
-                            label: Text(_waitingForOtp ? 'Xác minh OTP' : (_register ? 'Đăng ký' : 'Đăng nhập')),
+                                ? const SizedBox(
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                : const Icon(Icons.arrow_forward_rounded),
+                            label: Text(_register ? 'Đăng ký' : 'Đăng nhập'),
                           ),
                           const SizedBox(height: 8),
-                          if (_waitingForOtp)
-                            TextButton(onPressed: _busy ? null : () => setState(() { _waitingForOtp = false; _otp.clear(); }),
-                                child: const Text('Quay lại đăng nhập'))
-                          else
-                            TextButton(
-                              onPressed: _busy ? null : () => setState(() { _register = !_register; _error = null; }),
-                              child: Text(_register ? 'Đã có tài khoản? Đăng nhập' : 'Chưa có tài khoản? Đăng ký'),
+                          TextButton(
+                            onPressed: _busy
+                                ? null
+                                : () => setState(() {
+                                    _register = !_register;
+                                    _error = null;
+                                  }),
+                            child: Text(
+                              _register
+                                  ? 'Đã có tài khoản? Đăng nhập'
+                                  : 'Chưa có tài khoản? Đăng ký',
                             ),
-                          const SizedBox(height: 8),
-                          Text('Kết nối bảo mật qua HTTPS', textAlign: TextAlign.center,
-                              style: Theme.of(context).textTheme.labelSmall?.copyWith(color: colors.onSurfaceVariant)),
+                          ),
                         ],
                       ),
                     ),
@@ -245,19 +356,36 @@ class _AuthPageState extends State<AuthPage> {
     );
   }
 
-  Widget _field(TextEditingController controller, String label, IconData icon,
-      {TextInputType? keyboardType, String? Function(String?)? validator}) => TextFormField(
-        controller: controller,
-        keyboardType: keyboardType,
-        validator: validator ?? _required,
-        decoration: InputDecoration(labelText: label, prefixIcon: Icon(icon)),
-      );
+  Widget _field(
+    TextEditingController controller,
+    String label,
+    IconData icon, {
+    TextInputType? keyboardType,
+    String? Function(String?)? validator,
+  }) => TextFormField(
+    controller: controller,
+    keyboardType: keyboardType,
+    validator: validator ?? _required,
+    decoration: InputDecoration(labelText: label, prefixIcon: Icon(icon)),
+  );
 
-  String? _required(String? value) => value == null || value.trim().isEmpty ? 'Trường này không được để trống.' : null;
+  String? _required(String? value) => value == null || value.trim().isEmpty
+      ? 'Trường này không được để trống.'
+      : null;
+
+  String? _validEmail(String? value) {
+    final email = value?.trim() ?? '';
+    if (!RegExp(r'^[^\s@]+@[^\s@]+\.[^\s@]+$').hasMatch(email)) {
+      return 'Nhập địa chỉ Gmail / email hợp lệ.';
+    }
+    return null;
+  }
 
   String? _validUsername(String? value) {
     final username = value?.trim() ?? '';
-    if (username.length < 3 || username.length > 40) return 'Tên đăng nhập cần từ 3 đến 40 ký tự.';
+    if (username.length < 3 || username.length > 40) {
+      return 'Tên đăng nhập cần từ 3 đến 40 ký tự.';
+    }
     if (!RegExp(r'^[\p{L}\p{N}_.-]+$', unicode: true).hasMatch(username)) {
       return 'Chỉ dùng chữ cái, số, dấu chấm, gạch dưới hoặc gạch ngang.';
     }

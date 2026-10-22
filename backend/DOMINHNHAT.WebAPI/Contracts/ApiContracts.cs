@@ -1,9 +1,7 @@
 namespace DOMINHNHAT.WebAPI.Contracts;
 
-public sealed record RegisterRequest(string Username, string Email, string Password, string AccountType = "Employee");
+public sealed record RegisterRequest(string Username, string Email, string Password, string IdToken, string AccountType = "Employee");
 public sealed record LoginRequest(string Username, string Password);
-public sealed record VerifyOtpRequest(string ChallengeId, string Code);
-public sealed record AuthChallengeResponse(string ChallengeId, string Message, DateTimeOffset ExpiresAtUtc);
 public sealed record AuthResponse(string AccessToken, string RefreshToken, string TokenType, DateTimeOffset ExpiresAtUtc, UserResponse User);
 public sealed record RefreshRequest(string RefreshToken);
 public sealed record LogoutRequest(string RefreshToken);
