@@ -2,8 +2,8 @@
 2. Đăng nhập bằng username và mật khẩu
 3. Phân quyền Admin/Employee/Guest
 4. Các chức năng CRUD — 4.5/5
-5. Chọn 3/6 chức năng nâng cao — 2
+5. Chọn 3/6 chức năng nâng cao — 1
 6. Tính năng mới — 0.5
 7. Giao diện đẹp, dễ dùng — 0.5
 
-TỔNG ĐIỂM DỰ KIẾN — 7.5
+TỔNG ĐIỂM DỰ KIẾN — 6.5
